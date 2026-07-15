@@ -16,7 +16,9 @@ equivalent), loads, shunt capacitors, switches and the source. With
 ``import_controllers=True``, each ``RegControl`` is additionally imported as a
 ``DiscreteTapControl``, so the tap responds to bus voltage during
 ``pandapower.control.run_control`` instead of staying pinned at the OpenDSS
-operating point; line-drop compensation, reverse-mode regulation and time delays
+operating point; a ``RegControl`` with line-drop compensation becomes a
+``LineDropCompensationTapControl`` instead, regulating the estimated downstream
+voltage rather than its own terminal. Reverse-mode regulation and time delays
 are not modeled and are reported as warnings when encountered.
 
 Positive-sequence is exact for symmetric (e.g. European 3-phase 4-wire) feeders and

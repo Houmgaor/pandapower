@@ -90,6 +90,14 @@ class DiscreteTapControl(TrafoController):
         else:
             self._hunting_taps = np.nan
 
+    def _get_controlled_vm_pu(self, net):
+        """Voltage that the tap decision is based on. Factored out of
+        control_step/is_converged so a subclass (e.g. line-drop compensation)
+        only has to override this one method to change what "the voltage" means
+        for both.
+        """
+        return read_from_net(net, "res_bus", self.trafobus, "vm_pu", self._read_write_flag)
+
     def control_step(self, net):
         """
         Implements one step of the Discrete controller, always stepping only one tap position up or down
@@ -97,7 +105,7 @@ class DiscreteTapControl(TrafoController):
         if self.nothing_to_do(net):
             return
 
-        vm_pu = read_from_net(net, "res_bus", self.trafobus, "vm_pu", self._read_write_flag)
+        vm_pu = self._get_controlled_vm_pu(net)
         self.tap_pos = read_from_net(
             net, self.element, self.element_index, "tap_pos", self._read_write_flag).copy()
 
@@ -125,7 +133,7 @@ class DiscreteTapControl(TrafoController):
         if self.nothing_to_do(net):
             return True
 
-        vm_pu = read_from_net(net, "res_bus", self.trafobus, "vm_pu", self._read_write_flag)
+        vm_pu = self._get_controlled_vm_pu(net)
         # this is possible in case the trafo is set out of service by the connectivity check
         is_nan = np.isnan(vm_pu)
         self.tap_pos = read_from_net(

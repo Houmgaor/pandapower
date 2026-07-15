@@ -139,6 +139,7 @@ class _RegControlInfo:
     vreg: float
     band: float
     ptratio: float
+    ctprimary: float
     forward_r: float
     forward_x: float
     is_reversible: bool
@@ -167,6 +168,7 @@ def _collect_regcontrols():
             vreg=dss.RegControls.ForwardVreg(),
             band=dss.RegControls.ForwardBand(),
             ptratio=dss.RegControls.PTRatio(),
+            ctprimary=dss.RegControls.CTPrimary(),
             forward_r=dss.RegControls.ForwardR(),
             forward_x=dss.RegControls.ForwardX(),
             is_reversible=bool(dss.RegControls.IsReversible()),
@@ -343,7 +345,8 @@ def from_opendss(path: str, solve: bool=True, import_controllers: bool=False):
     * Transformer (3W CT) -> ``trafo``: center-tapped split-phase mapped to a 2W equivalent
     * Load -> ``load``: kW/kvar -> p_mw/q_mvar
     * Capacitor -> ``shunt``: kvar -> -q_mvar (injection)
-    * RegControl -> ``DiscreteTapControl`` (only if ``import_controllers=True``)
+    * RegControl -> ``DiscreteTapControl``/``LineDropCompensationTapControl``
+      (only if ``import_controllers=True``)
 
     A transformer's solved OpenDSS tap is translated into pandapower's
     ``tap_pos``/``tap_min``/``tap_max``/``tap_step_percent``/``tap_neutral``
@@ -353,12 +356,15 @@ def from_opendss(path: str, solve: bool=True, import_controllers: bool=False):
     ``import_controllers=True``, each ``RegControl`` additionally becomes a
     ``DiscreteTapControl`` on the mapped trafo, so the tap responds to bus
     voltage during ``pandapower.control.run_control``/timeseries instead of
-    being pinned at the OpenDSS operating point. Line-drop compensation,
-    reverse-mode regulation and time delays are not modeled; when a RegControl
-    uses them, or monitors a bus other than its own tapped winding's terminal,
-    this is reported as a warning rather than guessed at (and, for an
-    unsupported monitored bus, the controller is skipped entirely rather than
-    silently regulating the wrong bus). Three-winding center-tapped service
+    being pinned at the OpenDSS operating point. A RegControl with line-drop
+    compensation (``R``/``X``) becomes a ``LineDropCompensationTapControl``
+    instead, which regulates the estimated downstream voltage (terminal minus
+    the drop across the compensator impedance) rather than its own terminal.
+    Reverse-mode regulation and time delays are still not modeled; when a
+    RegControl uses them, or monitors a bus other than its own tapped
+    winding's terminal, this is reported as a warning rather than guessed at
+    (and, for an unsupported monitored bus, the controller is skipped entirely
+    rather than silently regulating the wrong bus). Three-winding center-tapped service
     transformers (two LV windings on the same secondary bus) are collapsed to
     a balanced two-winding equivalent and are not matched to a RegControl.
     Because positive-sequence modeling cannot represent 120/240 V split-phase
@@ -651,10 +657,11 @@ def _add_reg_controls(net, report, regcontrols_by_trafo, trafo_index_by_name, im
     """
     Create a ``DiscreteTapControl`` for each RegControl whose transformer was imported.
 
-    This makes the tap respond to voltage instead of staying pinned at the
-    OpenDSS-solved position. Only called with effect when
-    ``import_controllers`` is True; regardless of that flag, an unreachable
-    transformer is still reported so the omission isn't silent.
+    Uses ``LineDropCompensationTapControl`` instead when line-drop
+    compensation applies. This makes the tap respond to voltage instead of
+    staying pinned at the OpenDSS-solved position. Only called with effect
+    when ``import_controllers`` is True; regardless of that flag, an
+    unreachable transformer is still reported so the omission isn't silent.
     """
     for trafo_name, regctrls in regcontrols_by_trafo.items():
         tid = trafo_index_by_name.get(trafo_name)
@@ -691,8 +698,6 @@ def _add_reg_controls(net, report, regcontrols_by_trafo, trafo_index_by_name, im
             continue
 
         notes = []
-        if reg.forward_r or reg.forward_x:
-            notes.append(f"line-drop compensation (R={reg.forward_r}, X={reg.forward_x}) ignored")
         if reg.is_reversible:
             notes.append("reverse-mode settings ignored")
         if reg.delay or reg.tap_delay or reg.is_inverse_time:
@@ -709,12 +714,37 @@ def _add_reg_controls(net, report, regcontrols_by_trafo, trafo_index_by_name, im
         vm_center_pu = reg.vreg * reg.ptratio * _SQRT3 / 1000.0 / vn_kv
         vm_half_band_pu = reg.band / 2.0 * reg.ptratio * _SQRT3 / 1000.0 / vn_kv
 
-        pp.control.DiscreteTapControl(
-            net, element_index=tid,
-            vm_lower_pu=vm_center_pu - vm_half_band_pu,
-            vm_upper_pu=vm_center_pu + vm_half_band_pu,
-            side=tap_side,
-        )
+        wants_ldc = bool(reg.forward_r or reg.forward_x)
+        if wants_ldc and reg.ctprimary <= 0:
+            report.warn(f"RegControl {reg.name!r} has line-drop compensation (R={reg.forward_r}, "
+                        f"X={reg.forward_x}) but a non-positive CTPrimary ({reg.ctprimary}), which "
+                        "the ohms-per-CTPrimary-rated-current conversion cannot use; imported "
+                        "without compensation, regulating its own terminal instead")
+            wants_ldc = False
+
+        if wants_ldc:
+            # OpenDSS's R/X dials are volts at rated CTPrimary current, referred
+            # through the PT/CT combination, not actual ohms -- the standard
+            # regulator-calibration conversion back to real line impedance
+            # (verified against RegControl.pas: ILDC = Iwinding/CTPrimary,
+            # VLDC = (R+jX)*ILDC, added to Vcontrol=Vterminal/PTratio) is
+            # ohms = volts * ptratio / ctprimary.
+            r_ohm = reg.forward_r * reg.ptratio / reg.ctprimary
+            x_ohm = reg.forward_x * reg.ptratio / reg.ctprimary
+            pp.control.LineDropCompensationTapControl(
+                net, element_index=tid,
+                vm_lower_pu=vm_center_pu - vm_half_band_pu,
+                vm_upper_pu=vm_center_pu + vm_half_band_pu,
+                r_ohm=r_ohm, x_ohm=x_ohm,
+                side=tap_side,
+            )
+        else:
+            pp.control.DiscreteTapControl(
+                net, element_index=tid,
+                vm_lower_pu=vm_center_pu - vm_half_band_pu,
+                vm_upper_pu=vm_center_pu + vm_half_band_pu,
+                side=tap_side,
+            )
         report.n_reg_controls += 1
 
 

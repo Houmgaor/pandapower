@@ -52,6 +52,15 @@ Discrete Tap Control
     :members:
 
 
+-------------
+
+**********************************
+Line Drop Compensation Tap Control
+**********************************
+.. autoclass:: pandapower.control.controller.trafo.LineDropCompensationTapControl.LineDropCompensationTapControl
+    :members:
+
+
 DER Controller
 ===============
 .. autoclass:: pandapower.control.controller.DERController.der_control.DERController

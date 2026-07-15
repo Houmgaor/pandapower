@@ -393,8 +393,9 @@ solve
 """
 
 # Same RegControl, but with line-drop compensation (R/X) and reverse mode enabled.
-# Neither is implemented, so importing this must warn about both explicitly
-# instead of silently ignoring or guessing at them.
+# LDC is implemented (LineDropCompensationTapControl); reverse mode is not, so
+# importing this must still warn about reverse mode explicitly instead of
+# silently ignoring or guessing at it.
 REGCONTROL_LDC_REVERSIBLE_FEEDER = """
 clear
 new circuit.regldc basekv=12.47 pu=1.0 phases=3 bus1=sourcebus
@@ -402,6 +403,22 @@ new transformer.t1 phases=3 windings=2 xhl=5.0
 ~ wdg=1 bus=sourcebus conn=wye kv=12.47 kva=500 %r=0.5
 ~ wdg=2 bus=b2 conn=wye kv=0.48 kva=500 %r=0.5 maxtap=1.1 mintap=0.9 numtaps=32
 new regcontrol.reg1 transformer=t1 winding=2 vreg=122 band=2 ptratio=2.3094 R=3 X=1 reversible=yes
+new load.load1 bus1=b2 phases=3 kv=0.48 kw=200 kvar=80 conn=wye
+set voltagebases=[12.47, 0.48]
+calcvoltagebases
+solve
+"""
+
+# CTprim=0 (accepted by OpenDSS itself without error) makes the ohms = volts *
+# ptratio / ctprimary conversion a division by zero; this must degrade to a
+# warning and a plain (uncompensated) controller, not crash the whole import.
+REGCONTROL_LDC_DEGENERATE_CTPRIMARY_FEEDER = """
+clear
+new circuit.regldc basekv=12.47 pu=1.0 phases=3 bus1=sourcebus
+new transformer.t1 phases=3 windings=2 xhl=5.0
+~ wdg=1 bus=sourcebus conn=wye kv=12.47 kva=500 %r=0.5
+~ wdg=2 bus=b2 conn=wye kv=0.48 kva=500 %r=0.5 maxtap=1.1 mintap=0.9 numtaps=32
+new regcontrol.reg1 transformer=t1 winding=2 vreg=122 band=2 ptratio=2.3094 R=3 X=1 CTprim=0
 new load.load1 bus1=b2 phases=3 kv=0.48 kw=200 kvar=80 conn=wye
 set voltagebases=[12.47, 0.48]
 calcvoltagebases
@@ -490,7 +507,10 @@ def test_regcontrol_creates_discrete_tap_control(regcontrol_net_controlled):
     assert regcontrol_net_controlled["opendss_import"]["n_reg_controls"] == 1
     assert len(regcontrol_net_controlled.controller) == 1
     ctrl = regcontrol_net_controlled.controller.object.iloc[0]
-    assert isinstance(ctrl, DiscreteTapControl)
+    # R=X=0 (no LDC settings on this RegControl): must get a plain
+    # DiscreteTapControl, not the LineDropCompensationTapControl subclass --
+    # the regression guard for "R=X=0 controllers are unchanged".
+    assert type(ctrl) is DiscreteTapControl
     assert ctrl.element_index == regcontrol_net_controlled.trafo.index[0]
     assert ctrl.side == "lv"
     # vreg=122, band=2, ptratio=2.3094: PT secondary volts referred to the
@@ -519,21 +539,105 @@ def test_regcontrol_pv_export_taps_down(regcontrol_feeder_path):
     assert net.trafo.tap_pos.iloc[0] < baseline_tap
 
 
-def test_regcontrol_ldc_and_reverse_mode_warn_not_silently_ignored(tmp_path):
+@pytest.fixture
+def regcontrol_ldc_feeder_path(tmp_path):
     p = tmp_path / "regldc.dss"
     p.write_text(REGCONTROL_LDC_REVERSIBLE_FEEDER)
-    net = from_opendss(str(p), import_controllers=True)
+    return str(p)
+
+
+def test_regcontrol_reverse_mode_still_warns_ldc_does_not(regcontrol_ldc_feeder_path):
+    net = from_opendss(regcontrol_ldc_feeder_path, import_controllers=True)
 
     warnings = " ".join(net["opendss_import"]["warnings"])
-    assert "line-drop compensation" in warnings
+    assert "line-drop compensation" not in warnings
     assert "reverse-mode" in warnings
-    # LDC/reverse mode are unsupported, but the controller is still created
-    # (regulating its own terminal, without compensation): an imperfect
-    # regulator beats a frozen tap, provided the user is told what's missing.
+    # Reverse mode is unsupported but the controller is still created
+    # (regulating the compensated voltage in the forward direction only): an
+    # imperfect regulator beats a frozen tap, provided the user is told what's
+    # missing.
     assert len(net.controller) == 1
 
 
-def test_regcontrol_remote_monitored_bus_skips_controller(tmp_path):
+def test_regcontrol_ldc_creates_compensation_controller(regcontrol_ldc_feeder_path):
+    from pandapower.control import LineDropCompensationTapControl
+
+    net = from_opendss(regcontrol_ldc_feeder_path, import_controllers=True)
+    ctrl = net.controller.object.iloc[0]
+    assert type(ctrl) is LineDropCompensationTapControl
+    # R=3, X=1 (volts, PT/CT-secondary-referred), ptratio=2.3094, ctprimary
+    # defaults to 300: ohms = volts * ptratio / ctprimary -- independently
+    # computed, not read back from the code under test.
+    assert ctrl.r_ohm == pytest.approx(3 * 2.3094 / 300, rel=1e-6)
+    assert ctrl.x_ohm == pytest.approx(1 * 2.3094 / 300, rel=1e-6)
+
+
+def test_regcontrol_ldc_matches_opendss_tap_decision(regcontrol_ldc_feeder_path):
+    # The whole point of line-drop compensation: without it, DiscreteTapControl
+    # regulates the trafo's own terminal and lands on the wrong tap (verified
+    # below); with it, run_control must land on (or within one step of) the
+    # tap OpenDSS's own regulator -- which *does* model LDC -- converges to.
+    import opendssdirect as dss
+
+    dss.Text.Command("clear")
+    for line in REGCONTROL_LDC_REVERSIBLE_FEEDER.strip().splitlines():
+        dss.Text.Command(line)
+    dss.RegControls.Name("reg1")
+    opendss_tap = dss.RegControls.TapNumber()
+
+    net = from_opendss(regcontrol_ldc_feeder_path, import_controllers=True)
+    tid = net.trafo.index[0]
+    net.trafo.at[tid, "tap_pos"] = net.trafo.at[tid, "tap_neutral"]
+    pp.control.run_control(net)
+    assert abs(net.trafo.tap_pos.iloc[0] - opendss_tap) <= 1
+
+    # Without compensation, the same band regulates the wrong (own-terminal)
+    # voltage and converges to a visibly different, wrong tap.
+    from pandapower.control import DiscreteTapControl
+
+    net_no_ldc = from_opendss(regcontrol_ldc_feeder_path, import_controllers=True)
+    ctrl = net_no_ldc.controller.object.iloc[0]
+    net_no_ldc.controller = net_no_ldc.controller.iloc[0:0]
+    net_no_ldc.trafo.at[tid, "tap_pos"] = net_no_ldc.trafo.at[tid, "tap_neutral"]
+    DiscreteTapControl(net_no_ldc, element_index=tid, vm_lower_pu=ctrl.vm_lower_pu,
+                       vm_upper_pu=ctrl.vm_upper_pu, side="lv")
+    pp.control.run_control(net_no_ldc)
+    assert abs(net_no_ldc.trafo.tap_pos.iloc[0] - opendss_tap) > 1
+
+
+def test_regcontrol_ldc_pv_export_still_taps_down(regcontrol_ldc_feeder_path):
+    # LDC changes *what* is regulated, not the basic tap-response-to-PV
+    # behaviour: exporting enough PV downstream must still tap the transformer
+    # down relative to the no-PV baseline.
+    baseline = from_opendss(regcontrol_ldc_feeder_path, import_controllers=True)
+    pp.control.run_control(baseline)
+    baseline_tap = baseline.trafo.tap_pos.iloc[0]
+
+    net = from_opendss(regcontrol_ldc_feeder_path, import_controllers=True)
+    b2 = net.bus[net.bus["name"].str.lower() == "b2"].index[0]
+    pp.create_sgen(net, b2, p_mw=0.9, q_mvar=0.0, name="pv")
+    pp.control.run_control(net)
+
+    assert net.trafo.tap_pos.iloc[0] < baseline_tap
+    ctrl = net.controller.object.iloc[0]
+    vm_comp = ctrl._get_controlled_vm_pu(net)
+    assert ctrl.vm_lower_pu <= vm_comp <= ctrl.vm_upper_pu
+
+
+def test_regcontrol_ldc_degenerate_ctprimary_falls_back_without_crashing(tmp_path):
+    # CTprim=0 makes ohms = volts * ptratio / ctprimary a division by zero.
+    # OpenDSS itself accepts CTprim=0 without error, so this must degrade to a
+    # warning and a plain (uncompensated) DiscreteTapControl, not raise and
+    # abort the whole from_opendss() conversion.
+    from pandapower.control import DiscreteTapControl
+
+    p = tmp_path / "regldc_degenerate_ct.dss"
+    p.write_text(REGCONTROL_LDC_DEGENERATE_CTPRIMARY_FEEDER)
+    net = from_opendss(str(p), import_controllers=True)
+
+    assert len(net.controller) == 1
+    assert type(net.controller.object.iloc[0]) is DiscreteTapControl
+    assert any("non-positive CTPrimary" in w for w in net["opendss_import"]["warnings"])
     p = tmp_path / "regremote.dss"
     p.write_text(REGCONTROL_REMOTE_BUS_FEEDER)
     net = from_opendss(str(p), import_controllers=True)

@@ -5,6 +5,7 @@ Change Log
 -------------------------------
 - [ADDED] OpenDSS converter: series (bus-to-bus) ``Reactor`` elements are now imported as a fixed-impedance ``line``, the pattern some feeder libraries (e.g. EPRI's Ckt5/Ckt7) use to model the substation's Thevenin-equivalent source impedance instead of a ``Transformer``.
 - [ADDED] OpenDSS converter: ``from_opendss`` imports a transformer's tap changer (``tap_pos``/``tap_min``/``tap_max``/``tap_step_percent``/``tap_neutral``) instead of baking the solved ratio into ``vn_hv_kv``/``vn_lv_kv``, and can import each ``RegControl`` as a ``DiscreteTapControl`` via the new ``import_controllers`` option (default False).
+- [ADDED] New ``LineDropCompensationTapControl`` (subclass of ``DiscreteTapControl``) regulates a compensated voltage (terminal minus the drop across a compensator impedance, from the trafo's own winding current) instead of the terminal itself; the OpenDSS converter uses it automatically for a ``RegControl`` with line-drop compensation (``R``/``X``) instead of warning and ignoring it.
 
 [3.5.4] - 2026-07-08
 -------------------------------
